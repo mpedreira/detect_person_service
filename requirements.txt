@@ -1,0 +1,11 @@
+fastapi>=0.115.6
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+deepface>=0.0.93
+imageio-ffmpeg>=0.6.0
+tf-keras>=2.21.0
+# Person detection (MediaPipe preferred for accuracy, falls back to OpenCV)
+mediapipe>=0.10.0
+# Image processing (used by PersonDetector and DeepFace)
+Pillow>=10.0.0
+opencv-python-headless>=4.8.0
