@@ -19,7 +19,8 @@ TMP_DIR = os.getenv("AGENTS_TMP_DIR", "/tmp/agents")
 MODEL_NAME = os.getenv("DEEPFACE_MODEL_NAME", "Facenet512")
 DETECTOR_BACKEND = os.getenv("DEEPFACE_DETECTOR_BACKEND", "retinaface")
 DEFAULT_FPS = float(os.getenv("VIDEO_SAMPLE_FPS", "1.0"))
-DEFAULT_MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "70.0"))
+DEFAULT_MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "85.0"))
+MIN_UNKNOWN_CONFIDENCE = float(os.getenv("MIN_UNKNOWN_CONFIDENCE", "60.0"))
 
 FACE_DB_DIR = str(Path(DATA_DIR) / "faces")
 Path(TMP_DIR).mkdir(parents=True, exist_ok=True)
@@ -226,6 +227,7 @@ def detect_person(
             embedding=item["embedding"],
             known_embeddings=known_embeddings,
             min_confidence=min_confidence,
+            min_unknown_confidence=MIN_UNKNOWN_CONFIDENCE,
         )
         if not match:
             continue
@@ -302,6 +304,7 @@ def detect_person_image(
             embedding=embedding,
             known_embeddings=known_embeddings,
             min_confidence=min_confidence,
+            min_unknown_confidence=MIN_UNKNOWN_CONFIDENCE,
         )
         if match:
             detections.append(

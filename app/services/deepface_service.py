@@ -78,8 +78,21 @@ def find_best_match(
     embedding: list[float],
     known_embeddings: dict[str, list[list[float]]],
     min_confidence: float,
+    min_unknown_confidence: float = 0.0,
 ) -> FaceMatch | None:
-    """Find closest known person based on cosine distance."""
+    """Find closest known person, or mark as unknown if confidence in range.
+    
+    Args:
+        embedding: Face embedding vector
+        known_embeddings: Dictionary of registered persons and their embeddings
+        min_confidence: Threshold to report as known person
+        min_unknown_confidence: Minimum threshold to report as unknown (default 0.0 = always report if < min_confidence)
+    
+    Returns:
+        FaceMatch with known person if >= min_confidence,
+        FaceMatch with "unknown" if min_unknown_confidence <= confidence < min_confidence,
+        None if confidence < min_unknown_confidence or no embeddings to compare.
+    """
     best: FaceMatch | None = None
     for person_name, people_embeddings in known_embeddings.items():
         for candidate in people_embeddings:
@@ -93,10 +106,12 @@ def find_best_match(
                 )
     if best is None:
         return None
-    if best.confidence < min_confidence:
+    if best.confidence >= min_confidence:
+        return best
+    if best.confidence >= min_unknown_confidence:
         return FaceMatch(
             person_name="unknown",
             confidence=best.confidence,
             distance=best.distance,
         )
-    return best
+    return None
