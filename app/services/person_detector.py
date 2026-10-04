@@ -32,6 +32,11 @@ class PersonDetector:
         try:
             import mediapipe as mp  # pylint: disable=import-outside-toplevel
 
+            # mediapipe >= 0.10.30 / 1.x dropped the legacy "solutions" API.
+            if not hasattr(mp, "solutions"):
+                raise RuntimeError(
+                    f"mediapipe {getattr(mp, '__version__', '?')} has no legacy solutions API"
+                )
             self._detector = mp.solutions.pose.Pose(
                 static_image_mode=True,
                 model_complexity=0,  # lite model for speed
@@ -90,10 +95,12 @@ class PersonDetector:
 
     def _detect_with_mediapipe(self, image_path: str) -> bool:
         """Detect person using MediaPipe Pose."""
+        import numpy as np  # pylint: disable=import-outside-toplevel
         from PIL import Image  # pylint: disable=import-outside-toplevel
 
         try:
-            image = Image.open(image_path).convert("RGB")
+            # MediaPipe expects an RGB numpy array, not a PIL image.
+            image = np.asarray(Image.open(image_path).convert("RGB"))
             result = self._detector.process(image)
 
             has_landmarks = (

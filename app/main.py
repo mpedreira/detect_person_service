@@ -8,7 +8,13 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 
-from .services.deepface_service import extract_embedding, find_best_match
+from .services.deepface_service import (
+    DetectedFace,
+    deduplicate_embeddings,
+    extract_faces,
+    find_best_match,
+    prepare_known_embeddings,
+)
 from .services.face_store import FaceStore
 from .services.person_detector import PersonDetector
 from .services.video_processing import FFmpegError, extract_frames, extract_frames_with_person_filter
@@ -21,6 +27,12 @@ DETECTOR_BACKEND = os.getenv("DEEPFACE_DETECTOR_BACKEND", "retinaface")
 DEFAULT_FPS = float(os.getenv("VIDEO_SAMPLE_FPS", "1.0"))
 DEFAULT_MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "85.0"))
 MIN_UNKNOWN_CONFIDENCE = float(os.getenv("MIN_UNKNOWN_CONFIDENCE", "60.0"))
+# Face quality gates (detector confidence 0-1, face size in px, Laplacian variance).
+MIN_FACE_CONFIDENCE = float(os.getenv("MIN_FACE_CONFIDENCE", "0.9"))
+TRAIN_MIN_FACE_SIZE = int(os.getenv("TRAIN_MIN_FACE_SIZE", "60"))
+DETECT_MIN_FACE_SIZE = int(os.getenv("DETECT_MIN_FACE_SIZE", "30"))
+TRAIN_MIN_SHARPNESS = float(os.getenv("TRAIN_MIN_SHARPNESS", "25.0"))
+MATCH_TOP_K = int(os.getenv("MATCH_TOP_K", "3"))
 
 FACE_DB_DIR = str(Path(DATA_DIR) / "faces")
 Path(TMP_DIR).mkdir(parents=True, exist_ok=True)
@@ -48,25 +60,51 @@ def _read_image_upload(image: UploadFile) -> tuple[bytes, str]:
     return content, suffix
 
 
-def _extract_embeddings_from_video_bytes(
+def _frame_time_seconds(frame_name: str, fps: float) -> float:
+    """Timestamp of an extracted frame (ffmpeg numbers frames from 1)."""
+    try:
+        index = int(Path(frame_name).stem.rsplit("_", 1)[-1]) - 1
+    except ValueError:
+        return 0.0
+    return round(max(0, index) / fps, 2)
+
+
+def _detect_faces(image_path: str, training: bool) -> list[DetectedFace]:
+    try:
+        return extract_faces(
+            image_path,
+            model_name=MODEL_NAME,
+            detector_backend=DETECTOR_BACKEND,
+            min_face_confidence=MIN_FACE_CONFIDENCE,
+            min_face_size=TRAIN_MIN_FACE_SIZE if training else DETECT_MIN_FACE_SIZE,
+            min_sharpness=TRAIN_MIN_SHARPNESS if training else 0.0,
+        )
+    except Exception as exc:  # pragma: no cover - runtime model/backend failures
+        raise HTTPException(
+            status_code=500,
+            detail=f"DeepFace processing failed: {exc}",
+        ) from exc
+
+
+def _extract_faces_from_video_bytes(
     video_bytes: bytes,
     suffix: str,
     fps: float,
+    training: bool,
     filter_empty_frames: bool = False,
-    enforce_detection: bool = False,
-) -> tuple[list[dict], int]:
-    """Extract embeddings from video bytes, optionally filtering frames without persons.
+) -> tuple[list[tuple[str, list[DetectedFace]]], int, int]:
+    """Extract reliable faces from every sampled frame of a video.
 
     Args:
         video_bytes: Video file content
         suffix: File extension (e.g., ".mp4")
         fps: Frames per second to extract
-        filter_empty_frames: If True, only process frames with detected persons
+        training: Apply the stricter training quality gates
+        filter_empty_frames: Pre-filter frames with PersonDetector before DeepFace
 
     Returns:
-        Tuple of (embeddings_list, frames_filtered_out)
-        where embeddings_list is list of {"frame": str, "embedding": list[float]}
-        and frames_filtered_out is count of frames filtered due to no person detection.
+        Tuple of (frames, frames_filtered_out, frames_total) where frames is a
+        list of (frame_name, faces) for frames with at least one reliable face.
     """
     with tempfile.TemporaryDirectory(dir=TMP_DIR) as temp_dir:
         video_path = Path(temp_dir) / f"input{suffix}"
@@ -75,58 +113,57 @@ def _extract_embeddings_from_video_bytes(
         frame_dir = Path(temp_dir) / "frames"
         try:
             if filter_empty_frames:
-                frames, filtered_out = extract_frames_with_person_filter(
+                frame_paths, filtered_out = extract_frames_with_person_filter(
                     str(video_path),
                     fps=fps,
                     output_dir=str(frame_dir),
                     person_detector=person_detector,
                 )
             else:
-                frames = extract_frames(str(video_path), fps=fps, output_dir=str(frame_dir))
+                frame_paths = extract_frames(str(video_path), fps=fps, output_dir=str(frame_dir))
                 filtered_out = 0
         except FFmpegError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-        embeddings: list[dict] = []
-        for frame_path in frames:
-            try:
-                embedding = extract_embedding(
-                    image_path=frame_path,
-                    model_name=MODEL_NAME,
-                    detector_backend=DETECTOR_BACKEND,
-                    enforce_detection=enforce_detection,
-                )
-            except Exception as exc:  # pragma: no cover - runtime model/backend failures
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"DeepFace processing failed: {exc}",
-                ) from exc
-            if embedding is None:
-                continue
-            embeddings.append({"frame": Path(frame_path).name, "embedding": embedding})
-        return embeddings, filtered_out
+        frames: list[tuple[str, list[DetectedFace]]] = []
+        for frame_path in frame_paths:
+            faces = _detect_faces(frame_path, training=training)
+            if faces:
+                frames.append((Path(frame_path).name, faces))
+        return frames, filtered_out, len(frame_paths) + filtered_out
 
 
-def _extract_embedding_from_image_bytes(
+def _detect_faces_in_image_bytes(
     image_bytes: bytes,
     suffix: str,
-    enforce_detection: bool = False,
-) -> list[float] | None:
+    training: bool,
+) -> list[DetectedFace]:
     with tempfile.TemporaryDirectory(dir=TMP_DIR) as temp_dir:
         image_path = Path(temp_dir) / f"input{suffix}"
         image_path.write_bytes(image_bytes)
-        try:
-            return extract_embedding(
-                image_path=str(image_path),
-                model_name=MODEL_NAME,
-                detector_backend=DETECTOR_BACKEND,
-                enforce_detection=enforce_detection,
-            )
-        except Exception as exc:  # pragma: no cover - runtime model/backend failures
-            raise HTTPException(
-                status_code=500,
-                detail=f"DeepFace processing failed: {exc}",
-            ) from exc
+        return _detect_faces(str(image_path), training=training)
+
+
+def _match_face(face: DetectedFace, known: dict, min_confidence: float):
+    return find_best_match(
+        embedding=face.embedding,
+        known_embeddings=known,
+        min_confidence=min_confidence,
+        min_unknown_confidence=MIN_UNKNOWN_CONFIDENCE,
+        top_k=MATCH_TOP_K,
+    )
+
+
+def _detection_entry(frame: str, frame_time: float, face: DetectedFace, match) -> dict:
+    return {
+        "frame": frame,
+        "frame_time_seconds": frame_time,
+        "person_name": match.person_name,
+        "confidence": round(match.confidence, 2),
+        "distance": round(match.distance, 6),
+        "face_confidence": round(face.face_confidence, 4),
+        "facial_area": {key: face.area.get(key) for key in ("x", "y", "w", "h")},
+    }
 
 
 @app.get("/health")
@@ -152,7 +189,7 @@ def register_face(
     person_name: str,
     video: UploadFile = File(...),
     sample_fps: float = Form(DEFAULT_FPS),
-    filter_empty_frames: bool = Form(True),
+    filter_empty_frames: bool = Form(False),
 ) -> dict:
     """Train/register a person using frames extracted from an uploaded video.
 
@@ -160,7 +197,11 @@ def register_face(
         person_name: Name of the person to register
         video: Video file (MP4, AVI, etc.)
         sample_fps: Frames per second to extract
-        filter_empty_frames: If True (default), only process frames with detected persons
+        filter_empty_frames: If True, pre-filter frames with PersonDetector. Not needed
+            for accuracy: every frame already goes through the face quality gates.
+
+    Only frames with exactly one good-quality face are used, so another person
+    appearing in the video can never be stored under ``person_name``.
 
     Returns:
         Response with person_name, frames_used, frames_filtered_out, and total_embeddings.
@@ -169,19 +210,24 @@ def register_face(
         raise HTTPException(status_code=400, detail="sample_fps must be > 0")
 
     video_bytes, suffix = _read_upload(video)
-    embeddings, frames_filtered = _extract_embeddings_from_video_bytes(
+    frames, frames_filtered, frames_total = _extract_faces_from_video_bytes(
         video_bytes,
         suffix,
         sample_fps,
+        training=True,
         filter_empty_frames=filter_empty_frames,
-        enforce_detection=True,
     )
 
-    vectors = [item["embedding"] for item in embeddings]
+    single_face_frames = [faces[0].embedding for _, faces in frames if len(faces) == 1]
+    vectors = deduplicate_embeddings(single_face_frames)
     if not vectors:
         raise HTTPException(
             status_code=422,
-            detail="No faces could be extracted from provided video",
+            detail=(
+                "No usable faces could be extracted from provided video "
+                f"({frames_total} frames sampled, {len(frames)} with a good-quality face, "
+                f"{len(single_face_frames)} with exactly one face)"
+            ),
         )
 
     total = store.append_embeddings(person_name, vectors)
@@ -192,6 +238,8 @@ def register_face(
             "person_name": person_name,
             "frames_used": len(vectors),
             "frames_filtered_out": frames_filtered,
+            "frames_multiple_faces": len(frames) - len(single_face_frames),
+            "frames_duplicated": len(single_face_frames) - len(vectors),
             "total_embeddings": total,
         },
     }
@@ -209,45 +257,43 @@ def detect_person(
     if min_confidence < 0 or min_confidence > 100:
         raise HTTPException(status_code=400, detail="min_confidence must be between 0 and 100")
 
-    known_embeddings = store.load_all()
-    if not known_embeddings:
+    known = prepare_known_embeddings(store.load_all())
+    if not known:
         raise HTTPException(status_code=404, detail="No registered faces available")
 
     video_bytes, suffix = _read_upload(video)
-    embeddings, _ = _extract_embeddings_from_video_bytes(
+    frames, _, frames_total = _extract_faces_from_video_bytes(
         video_bytes,
         suffix,
         sample_fps,
-        filter_empty_frames=False,  # Detection uses all frames
+        training=False,
     )
 
     detections = []
-    for index, item in enumerate(embeddings):
-        match = find_best_match(
-            embedding=item["embedding"],
-            known_embeddings=known_embeddings,
-            min_confidence=min_confidence,
-            min_unknown_confidence=MIN_UNKNOWN_CONFIDENCE,
-        )
-        if not match:
-            continue
-        frame_time_seconds = round(index / sample_fps, 2)
-        detections.append(
-            {
-                "frame": item["frame"],
-                "frame_time_seconds": frame_time_seconds,
-                "person_name": match.person_name,
-                "confidence": round(match.confidence, 2),
-                "distance": round(match.distance, 6),
-            }
-        )
+    summary: dict[str, dict] = {}
+    for frame_name, faces in frames:
+        frame_time = _frame_time_seconds(frame_name, sample_fps)
+        for face in faces:
+            match = _match_face(face, known, min_confidence)
+            if not match:
+                continue
+            detections.append(_detection_entry(frame_name, frame_time, face, match))
+            person = summary.setdefault(
+                match.person_name,
+                {"frames": 0, "max_confidence": 0.0, "first_seen_seconds": frame_time},
+            )
+            person["frames"] += 1
+            person["max_confidence"] = max(person["max_confidence"], round(match.confidence, 2))
+            person["last_seen_seconds"] = frame_time
 
     return {
         "status_code": 200,
         "is_ok": True,
         "response": {
-            "frames_analyzed": len(embeddings),
+            "frames_analyzed": frames_total,
+            "frames_with_faces": len(frames),
             "detections": detections,
+            "summary": summary,
         },
     }
 
@@ -259,18 +305,19 @@ def register_face_image(
 ) -> dict:
     """Train/register a person using a single uploaded image."""
     image_bytes, suffix = _read_image_upload(image)
-    embedding = _extract_embedding_from_image_bytes(
-        image_bytes,
-        suffix,
-        enforce_detection=True,
-    )
-    if embedding is None:
+    faces = _detect_faces_in_image_bytes(image_bytes, suffix, training=True)
+    if not faces:
         raise HTTPException(
             status_code=422,
-            detail="No face could be extracted from provided image",
+            detail="No good-quality face could be extracted from provided image",
+        )
+    if len(faces) > 1:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Image contains {len(faces)} faces; provide an image with only one person",
         )
 
-    total = store.append_embeddings(person_name, [embedding])
+    total = store.append_embeddings(person_name, [faces[0].embedding])
     return {
         "status_code": 200,
         "is_ok": True,
@@ -291,31 +338,18 @@ def detect_person_image(
     if min_confidence < 0 or min_confidence > 100:
         raise HTTPException(status_code=400, detail="min_confidence must be between 0 and 100")
 
-    known_embeddings = store.load_all()
-    if not known_embeddings:
+    known = prepare_known_embeddings(store.load_all())
+    if not known:
         raise HTTPException(status_code=404, detail="No registered faces available")
 
     image_bytes, suffix = _read_image_upload(image)
-    embedding = _extract_embedding_from_image_bytes(image_bytes, suffix)
+    faces = _detect_faces_in_image_bytes(image_bytes, suffix, training=False)
 
     detections = []
-    if embedding is not None:
-        match = find_best_match(
-            embedding=embedding,
-            known_embeddings=known_embeddings,
-            min_confidence=min_confidence,
-            min_unknown_confidence=MIN_UNKNOWN_CONFIDENCE,
-        )
+    for face in faces:
+        match = _match_face(face, known, min_confidence)
         if match:
-            detections.append(
-                {
-                    "frame": "image",
-                    "frame_time_seconds": 0.0,
-                    "person_name": match.person_name,
-                    "confidence": round(match.confidence, 2),
-                    "distance": round(match.distance, 6),
-                }
-            )
+            detections.append(_detection_entry("image", 0.0, face, match))
 
     return {
         "status_code": 200,
